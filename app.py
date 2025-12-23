@@ -92,32 +92,75 @@ class EnergyProvider:
             return self._error_data("❌ Ошибка соединения")
 
     def _process_intervals(self, intervals: List[dict]) -> ScheduleData:
-        now = datetime.now()
-        now_str = now.strftime("%H:%M")
-        
-        current_status_code = "unknown"
-        current_status_enum = LightStatus.UNKNOWN
-        
-        timeline_str = ""
-        next_change_dt = None
-        next_type = ""
+    now = datetime.now()
+    now_str = now.strftime("%H:%M")
+    
+    current_status_enum = LightStatus.UNKNOWN
+    next_change_time = None
+    next_change_type = ""
+    
+    # 1. Генерируем таймлайн (24 часа = 24 символа для компактности в чате)
+    # Каждый символ представляет 1 час (объединяем два интервала по 30 мин)
+    timeline_chars = []
+    for i in range(0, len(intervals), 2):
+        # Берем статус первого получаса как основной для этого часа
+        status = intervals[i]["status"]
+        char = "🟦" if status == "on" else "⬛" if status == "off" else "⬜"
+        timeline_chars.append(char)
+    
+    timeline_str = "".join(timeline_chars)
 
-        # 1. Строим таймлайн и ищем текущий статус
-        for i, interval in enumerate(intervals):
-            status = interval["status"]
+    # 2. Определяем текущий статус и ищем ближайшее изменение
+    for i, interval in enumerate(intervals):
+        start = interval["start"]
+        end = interval["end"]
+        status = interval["status"]
+
+        if start <= now_str < end:
+            current_status_enum = {
+                "on": LightStatus.ON, 
+                "off": LightStatus.OFF, 
+                "maybe": LightStatus.POSSIBLE
+            }.get(status, LightStatus.UNKNOWN)
             
-            # Рисуем график
-            if i % 2 == 0:
-                timeline_str += "🟦" if status == "on" else "⬛" if status == "off" else "⬜"
+            # Ищем, когда статус станет другим
+            for future in intervals[i+1:]:
+                if future["status"] != status:
+                    next_change_time = future["start"]
+                    next_change_type = "Включення 💡" if future["status"] == "on" else "Відключення 🔌"
+                    break
+            break
 
-            # Определяем текущий статус
-            if interval["start"] <= now_str < interval["end"]:
-                current_status_code = status
-                current_status_enum = {
-                    "on": LightStatus.ON, 
-                    "off": LightStatus.OFF, 
-                    "maybe": LightStatus.POSSIBLE
-                }.get(status, LightStatus.UNKNOWN)
+    # 3. Формируем "Красивый" текст
+    header = {
+        LightStatus.ON: "💎 СВІТЛО Є",
+        LightStatus.OFF: "🌑 СВІТЛА НЕМАЄ",
+        LightStatus.POSSIBLE: "⚠️ МОЖЛИВЕ ВІДКЛЮЧЕННЯ"
+    }.get(current_status_enum, "❓ СТАТУС НЕВИЗНАЧЕНИЙ")
+
+    # Добавляем маркер текущего часа на таймлайн (маленькая стрелочка снизу)
+    current_hour = now.hour
+    pointer = " " * (current_hour) + "⬆️"
+
+    msg = f"**{header}**\n"
+    if next_change_time:
+        msg += f"🕔 {next_change_type} о **{next_change_time}**\n"
+    else:
+        msg += "✅ До кінця доби змін не планується\n"
+
+    msg += f"\n📊 **Графік на сьогодні:**\n"
+    msg += f"`{timeline_str}`\n"
+    msg += f"`{pointer}`\n"
+    msg += "00    06    12    18    24\n\n"
+    msg += "🟦 _є_ | ⬛ _нема_ | ⬜ _можливо_"
+
+    return ScheduleData(
+        status=current_status_enum,
+        message=msg,
+        timeline=timeline_str,
+        next_event_time=next_change_time, # Здесь можно передать строку для простоты
+        next_event_type=next_change_type
+    )
 
         # 2. Ищем СЛЕДУЮЩЕЕ изменение статуса
         # Проходим по интервалам начиная с текущего времени
