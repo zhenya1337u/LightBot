@@ -45,7 +45,6 @@ class ScheduleData:
 
 class EnergyProvider:
     def __init__(self):
-        # Кэш ключа "6_2" (queue_subqueue) на 60 секунд
         self.cache = TTLCache(maxsize=1000, ttl=60)
         self.session: Optional[aiohttp.ClientSession] = None
         self.ua = UserAgent()
@@ -55,96 +54,77 @@ class EnergyProvider:
             self.session = aiohttp.ClientSession()
         return self.session
 
-    async def close(self):
-        if self.session:
-            await self.session.close()
-
     async def fetch_real_status(self, queue: str, subqueue: str) -> ScheduleData:
-        """
-        Делает прямой запрос к backend-скрипту.
-        Принимает: queue=6, subqueue=2
-        Возвращает: HTML-фрагмент только для этой очереди.
-        """
         full_queue_id = f"{queue}.{subqueue}"
         cache_key = f"{queue}_{subqueue}"
 
         if cache_key in self.cache:
-            logger.info(f"Cache hit for {full_queue_id}")
             return self.cache[cache_key]
 
         try:
             session = await self.get_session()
-            
-            # Параметры запроса (как в вашем fetch)
-            params = {
-                "queue": queue,
-                "subqueue": subqueue,
-                "ts": int(time.time() * 1000) # Текущий timestamp в миллисекундах
-            }
-
-            # Заголовки (мимикрируем под браузер)
-            headers = {
-                "User-Agent": self.ua.random,
-                "Referer": Config.referer,
-                "Accept": "*/*",
-                "X-Requested-With": "XMLHttpRequest" # Хороший тон для AJAX запросов
-            }
-
-            logger.info(f"Requesting API for {full_queue_id}...")
+            params = {"queue": queue, "subqueue": subqueue, "ts": int(time.time() * 1000)}
+            headers = {"User-Agent": self.ua.random, "Referer": Config.referer}
             
             async with session.get(Config.api_url, params=params, headers=headers, timeout=10) as resp:
-                if resp.status != 200:
-                    logger.error(f"API Error {resp.status}")
-                    return ScheduleData(LightStatus.UNKNOWN, "Сервер не відповідачає", datetime.now().strftime("%H:%M"))
+                data = await resp.json() # Работаем напрямую с JSON
+
+            if not data.get("success"):
+                return ScheduleData(LightStatus.UNKNOWN, "⚠️ Помилка сайту", "")
+
+            intervals = data["data"]["today"]["intervals"]
+            now_str = datetime.now().strftime("%H:%M")
+            
+            current_status = LightStatus.UNKNOWN
+            next_event_time = None
+            timeline = ""
+            
+            # Логика обработки интервалов
+            for i, interval in enumerate(intervals):
+                start, end = interval["start"], interval["end"]
+                status = interval["status"] # "on", "off" или "maybe"
                 
-                # Сервер возвращает HTML-фрагмент
-                html_fragment = await resp.text()
+                # Формируем шкалу (каждый символ = 1 час, т.е. 2 интервала по 30 мин)
+                if i % 2 == 0:
+                    char = "🟦" if status == "on" else "⬛" if status == "off" else "⬜"
+                    timeline += char
 
-            # Парсим фрагмент
-            # Так как это ответ ЛИЧНО для нас, любой текст "немає" относится к НАШЕЙ очереди.
-            soup = BeautifulSoup(html_fragment, "lxml")
-            text_content = soup.get_text(separator=" ", strip=True).lower()
+                # Определяем текущий статус
+                if start <= now_str < end:
+                    current_status = LightStatus.ON if status == "on" else LightStatus.OFF if status == "off" else LightStatus.POSSIBLE
+                    # Ищем, когда статус изменится
+                    for future in intervals[i+1:]:
+                        if future["status"] != status:
+                            next_event_time = future["start"]
+                            break
             
-            status = LightStatus.UNKNOWN
+            # Красивый вывод
+            status_map = {
+                LightStatus.ON: ("🟢 Світло зараз є", "Відключення"),
+                LightStatus.OFF: ("🔴 Світла зараз немає", "Включення"),
+                LightStatus.POSSIBLE: ("🟡 Можливе відключення", "Зміна")
+            }
             
-            # Простая и надежная логика поиска в тексте ответа
-            if "світла немає" in text_content or "відсутнє" in text_content:
-                status = LightStatus.OFF
-                visual_msg = "🔴 **Світла немає**"
-            elif "світло є" in text_content or "заживлено" in text_content:
-                status = LightStatus.ON
-                visual_msg = "🟢 **Світло є**"
-            elif "можливе" in text_content:
-                status = LightStatus.POSSIBLE
-                visual_msg = "🟡 **Можливе відключення**"
-            else:
-                # Если текст непонятен, пробуем найти подсказку во фрагменте (например время включения)
-                # Часто там пишут "Світло буде за..."
-                if "світло буде" in text_content:
-                     status = LightStatus.OFF
-                     visual_msg = "🔴 **Світла немає** (знайдено прогноз включення)"
-                else:
-                     visual_msg = "⚠️ Статус не визначено (нестандартна відповідь)"
-
-            # Пытаемся вытащить время изменений (обычно это текст типа "за 1 год 49 хв")
-            # Можно просто вернуть весь чистый текст фрагмента, если он короткий
-            clean_text = soup.get_text(separator="\n", strip=True)
+            status_text, event_name = status_map.get(current_status, ("❓ Невідомо", "Зміна"))
             
-            # Формируем красивый ответ
-            final_message = f"{visual_msg}\n\n📄 _Інфо з сайту:_\n{clean_text}"
+            msg = f"**{status_text}**\n"
+            if next_event_time:
+                msg += f"⏳ {event_name} планується о **{next_event_time}**\n"
+            
+            msg += f"\nГрафік на сьогодні (00:00 - 24:00):\n`{timeline}`\n"
+            msg += "🟦-є | ⬛-немає | ⬜-можливо"
 
             result = ScheduleData(
-                status=status,
-                message=final_message,
+                status=current_status,
+                message=msg,
                 updated_at=datetime.now().strftime("%H:%M")
             )
-            
             self.cache[cache_key] = result
             return result
 
         except Exception as e:
-            logger.error(f"API/Parse error: {e}")
-            return ScheduleData(LightStatus.UNKNOWN, "Помилка з'єднання", datetime.now().strftime("%H:%M"))
+            logger.error(f"JSON Parse error: {e}")
+            return ScheduleData(LightStatus.UNKNOWN, "❌ Помилка обробки даних", "")
 
 # --- FSM & HANDLERS ---
 # (Эта часть остается без изменений, она идеальна)
