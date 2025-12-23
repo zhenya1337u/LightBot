@@ -1,52 +1,51 @@
 import asyncio
 import os
 import sys
+import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
-from typing import Optional, Dict
+from typing import Optional
 
 # Сторонние библиотеки
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from loguru import logger
 import aiohttp
 from cachetools import TTLCache
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
 
 # --- CONFIGURATION LAYER ---
-# Используем dataclass для типизированной конфигурации
 @dataclass
 class Config:
     token: str = os.getenv("BOT_TOKEN", "")
-    # URL сайта (заглушка, сюда нужно будет вставить реальный API или URL парсинга)
-    source_url: str = "https://svitlo.oe.if.ua/api/schedule" 
+    target_url: str = "https://m.nizhyn.online/noelectro/"
 
-# --- SERVICE LAYER (Бизнес-логика) ---
-# Этот слой отвечает ТОЛЬКО за получение данных. Он ничего не знает про Telegram.
+# --- SERVICE LAYER (Парсинг и логика) ---
 
 class LightStatus(Enum):
-    ON = "light_on"
-    OFF = "light_off"
-    POSSIBLE = "light_possible"
-    UNKNOWN = "unknown"
+    ON = "light_on"          # Світло є
+    OFF = "light_off"        # Світла немає
+    POSSIBLE = "light_possible" # Можливе відключення
+    UNKNOWN = "unknown"      # Не вдалося визначити
 
 @dataclass
 class ScheduleData:
     status: LightStatus
     message: str
-    next_change: str
+    updated_at: str
 
 class EnergyProvider:
     def __init__(self):
-        # Кэш на 1000 записей, каждая живет 60 секунд. 
-        # Это спасет нас от бана по IP сайтом-донором.
+        # Кэшируем ответы на 60 секунд, чтобы не нагружать сайт
         self.cache = TTLCache(maxsize=1000, ttl=60)
         self.session: Optional[aiohttp.ClientSession] = None
+        self.ua = UserAgent()
 
     async def get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -57,146 +56,180 @@ class EnergyProvider:
         if self.session:
             await self.session.close()
 
-    async def fetch_status(self, queue: str, subqueue: str) -> ScheduleData:
-        cache_key = f"{queue}_{subqueue}"
-        
-        # 1. Проверяем кэш
+    async def fetch_real_status(self, queue: str, subqueue: str) -> ScheduleData:
+        """
+        Парсит сайт m.nizhyn.online.
+        Ищет блоки, содержащие номер очереди (например '6.2'), и определяет статус.
+        """
+        full_queue = f"{queue}.{subqueue}" # Например "6.2"
+        cache_key = f"q_{full_queue}"
+
         if cache_key in self.cache:
-            logger.info(f"Cache hit for {cache_key}")
+            logger.info(f"Cache hit for {full_queue}")
             return self.cache[cache_key]
 
-        # 2. Если нет в кэше — идем в сеть (симуляция запроса)
         try:
-            # session = await self.get_session()
-            # async with session.get(...) as resp:
-            #     data = await resp.json()
+            logger.info(f"Fetching data from {Config.target_url}")
+            session = await self.get_session()
             
-            # ТУТ БУДЕТ РЕАЛЬНЫЙ ПАРСИНГ.
-            # Пока симулируем ответ API как на скриншоте пользователя
+            # Притворяемся мобильным браузером
+            headers = {'User-Agent': self.ua.random}
             
-            # Имитация задержки сети
-            await asyncio.sleep(0.5) 
+            async with session.get(Config.target_url, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    logger.error(f"Site returned status {resp.status}")
+                    return ScheduleData(LightStatus.UNKNOWN, "Сайт недоступен", datetime.now().strftime("%H:%M"))
+                
+                html = await resp.text()
+
+            # Парсим HTML
+            soup = BeautifulSoup(html, "lxml")
             
-            # Мок-данные (Mock Data)
-            mock_response = ScheduleData(
-                status=LightStatus.OFF,
-                message=f"Черга {queue}.{subqueue}: Світла немає",
-                next_change="через 1 год 49 хв (о 17:00)"
+            # Логика поиска: ищем текст, похожий на очередь
+            # На сайте обычно структура: <div>Черга 6.2</div> ... <div>Статус</div>
+            # Или таблица. Мы используем универсальный поиск по тексту.
+            
+            status = LightStatus.UNKNOWN
+            details = "Дані не знайдено"
+
+            # Ищем элемент, содержащий номер очереди (например "6.2")
+            # Используем регулярку, чтобы найти именно "6.2", а не "16.20"
+            target_el = soup.find(string=re.compile(fr"\b{re.escape(full_queue)}\b"))
+
+            if target_el:
+                # Обычно статус находится в родительском контейнере или соседнем элементе
+                # Поднимаемся к родительскому блоку (карточке)
+                parent = target_el.find_parent('div') or target_el.find_parent('tr')
+                
+                if parent:
+                    text_content = parent.get_text(separator=" ", strip=True).lower()
+                    
+                    # Анализ текста на ключевые слова
+                    if "немає" in text_content or "вимкнено" in text_content or "відсутнє" in text_content:
+                        status = LightStatus.OFF
+                        details = "Світла немає ⬛"
+                    elif "є світло" in text_content or "увімкнено" in text_content or "заживлено" in text_content:
+                        status = LightStatus.ON
+                        details = "Світло є 🟦"
+                    else:
+                        # Если текст не понятен, пробуем найти цветные индикаторы (классы css)
+                        # Часто используют классы red/green
+                        css_classes = str(parent).lower()
+                        if "red" in css_classes or "danger" in css_classes:
+                            status = LightStatus.OFF
+                            details = "Світла немає (визначено по кольору) ⬛"
+                        elif "green" in css_classes or "success" in css_classes:
+                            status = LightStatus.ON
+                            details = "Світло є (визначено по кольору) 🟦"
+                else:
+                    details = "Знайдено чергу, але статус неясний"
+            else:
+                # Если прям "6.2" не нашли, возможно там формат "6 черга, 2 підчерга"
+                # Тут можно добавить более сложную логику, но пока вернем базовый ответ
+                details = "Чергу на сторінці не знайдено. Перевірте номер."
+
+            result = ScheduleData(
+                status=status,
+                message=details,
+                updated_at=datetime.now().strftime("%H:%M")
             )
             
-            # 3. Сохраняем в кэш
-            self.cache[cache_key] = mock_response
-            return mock_response
+            self.cache[cache_key] = result
+            return result
 
         except Exception as e:
-            logger.error(f"Error fetching data: {e}")
-            return ScheduleData(LightStatus.UNKNOWN, "Ошибка получения данных", "---")
+            logger.error(f"Parse error: {e}")
+            return ScheduleData(LightStatus.UNKNOWN, "Помилка парсингу", datetime.now().strftime("%H:%M"))
 
-# --- FSM (Машина состояний) ---
+# --- FSM & HANDLERS ---
+
 class UserSettings(StatesGroup):
     choosing_queue = State()
     choosing_subqueue = State()
     main_menu = State()
 
-# --- HANDLERS LAYER (Взаимодействие с пользователем) ---
-
-async def get_main_keyboard(queue_info: str):
-    builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="💡 Статус сейчас", callback_data="status_now"))
-    builder.row(types.InlineKeyboardButton(text="📅 График на день", callback_data="schedule_day"))
-    builder.row(types.InlineKeyboardButton(text=f"⚙️ Изменить ({queue_info})", callback_data="change_settings"))
-    return builder.as_markup()
-
-# Инициализация бота и провайдера
+# Инициализация
 provider = EnergyProvider()
 dp = Dispatcher(storage=MemoryStorage())
 bot = Bot(token=Config.token)
 
+async def get_main_keyboard(queue_info: str):
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="💡 Статус зараз", callback_data="status_now"))
+    builder.row(types.InlineKeyboardButton(text=f"⚙️ Змінити ({queue_info})", callback_data="change_settings"))
+    return builder.as_markup()
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
-    logger.info(f"User {message.from_user.id} started bot")
     await message.answer(
-        "👋 Привет! Я профессиональный монитор отключений.\n"
-        "Давай настроим твою очередь. Выбери номер очереди:",
+        "👋 Привіт! Я моніторю сайт **m.nizhyn.online**.\n"
+        "Обери свою чергу:",
         reply_markup=generate_queue_kb()
     )
     await state.set_state(UserSettings.choosing_queue)
 
 def generate_queue_kb():
     builder = InlineKeyboardBuilder()
-    # Генерируем кнопки 1-6
     for i in range(1, 7):
-        builder.add(types.InlineKeyboardButton(text=f"Очередь {i}", callback_data=f"queue_{i}"))
+        builder.add(types.InlineKeyboardButton(text=f"Черга {i}", callback_data=f"queue_{i}"))
     builder.adjust(3)
     return builder.as_markup()
 
 def generate_subqueue_kb(queue_num: str):
     builder = InlineKeyboardBuilder()
-    # Генерируем под-очереди .1 - .4
     for i in range(1, 5):
-        full_code = f"{queue_num}.{i}"
-        builder.add(types.InlineKeyboardButton(text=f"{full_code}", callback_data=f"sub_{i}"))
+        builder.add(types.InlineKeyboardButton(text=f"{queue_num}.{i}", callback_data=f"sub_{i}"))
     builder.row(types.InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_queue"))
     builder.adjust(2)
     return builder.as_markup()
 
 @dp.callback_query(UserSettings.choosing_queue, F.data.startswith("queue_"))
-async def process_queue_choice(callback: types.CallbackQuery, state: FSMContext):
-    queue_num = callback.data.split("_")[1]
-    await state.update_data(queue=queue_num)
-    
-    await callback.message.edit_text(
-        f"✅ Очередь {queue_num} выбрана.\nТеперь выбери под-очередь:",
-        reply_markup=generate_subqueue_kb(queue_num)
-    )
+async def process_queue(callback: types.CallbackQuery, state: FSMContext):
+    q = callback.data.split("_")[1]
+    await state.update_data(queue=q)
+    await callback.message.edit_text(f"✅ Черга {q}. Обери підчергу:", reply_markup=generate_subqueue_kb(q))
     await state.set_state(UserSettings.choosing_subqueue)
 
+@dp.callback_query(UserSettings.choosing_subqueue, F.data == "back_to_queue")
+async def back_handler(callback: types.CallbackQuery, state: FSMContext):
+    await cmd_start(callback.message, state)
+
 @dp.callback_query(UserSettings.choosing_subqueue, F.data.startswith("sub_"))
-async def process_subqueue_choice(callback: types.CallbackQuery, state: FSMContext):
-    sub_num = callback.data.split("_")[1]
+async def process_subqueue(callback: types.CallbackQuery, state: FSMContext):
+    sub = callback.data.split("_")[1]
     data = await state.get_data()
-    queue_num = data.get("queue")
-    
-    full_group = f"{queue_num}.{sub_num}"
-    await state.update_data(subqueue=sub_num, full_group=full_group)
-    
+    q = data.get("queue")
+    full = f"{q}.{sub}"
+    await state.update_data(subqueue=sub, full_group=full)
     await callback.message.edit_text(
-        f"🎉 Настройка завершена!\nТвоя группа: **{full_group}**",
-        reply_markup=await get_main_keyboard(full_group),
+        f"✅ Налаштовано: **{full}**\nТисни кнопку нижче 👇",
+        reply_markup=await get_main_keyboard(full),
         parse_mode="Markdown"
     )
     await state.set_state(UserSettings.main_menu)
 
 @dp.callback_query(F.data == "change_settings")
-async def change_settings(callback: types.CallbackQuery, state: FSMContext):
+async def change(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await cmd_start(callback.message, state)
 
 @dp.callback_query(F.data == "status_now")
-async def check_status_handler(callback: types.CallbackQuery, state: FSMContext):
-    # Получаем данные пользователя из State (памяти)
+async def check_status(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     q, sq = data.get("queue"), data.get("subqueue")
     
-    if not q or not sq:
-        await callback.answer("Сначала выберите очередь!", show_alert=True)
-        return
-
-    # Запрашиваем данные у провайдера
-    # Тут происходит магия кэширования и асинхронности
-    schedule_data = await provider.fetch_status(q, sq)
+    # Отправляем "печатает...", так как парсинг может занять секунду
+    await bot.send_chat_action(callback.from_user.id, action="typing")
     
-    # Визуальное оформление
-    icon = "⬛" if schedule_data.status == LightStatus.OFF else "🟦"
-    if schedule_data.status == LightStatus.POSSIBLE: icon = "⬜"
-
+    info = await provider.fetch_real_status(q, sq)
+    
     text = (
-        f"{icon} **СТАТУС: {schedule_data.message}**\n\n"
-        f"⏳ Следующее изменение: {schedule_data.next_change}\n"
-        f"🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}"
+        f"📊 **Черга {data.get('full_group')}**\n\n"
+        f"{info.message}\n"
+        f"🕒 Оновлено: {info.updated_at}"
     )
     
-    # Edit message text, чтобы не спамить новыми сообщениями
+    # Чтобы избежать ошибки "message not modified"
     try:
         await callback.message.edit_text(
             text, 
@@ -204,22 +237,15 @@ async def check_status_handler(callback: types.CallbackQuery, state: FSMContext)
             parse_mode="Markdown"
         )
     except Exception:
-        # Если текст не изменился, Telegram вернет ошибку, игнорируем её
-        await callback.answer("Данные актуальны")
+        await callback.answer()
 
-# --- ENTRY POINT ---
 async def main():
-    # Настройка логирования
     logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
-    
-    logger.info("Starting bot...")
+    logger.info("Bot starting on Koyeb...")
     try:
         await dp.start_polling(bot)
     finally:
-        await provider.close() # Корректное закрытие соединений
+        await provider.close()
 
 if __name__ == "__main__":
-    if not Config.token:
-        logger.error("BOT_TOKEN is not set!")
-        sys.exit(1)
     asyncio.run(main())
