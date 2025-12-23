@@ -1,7 +1,7 @@
 import asyncio
 import os
 import sys
-import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -24,9 +24,12 @@ from fake_useragent import UserAgent
 @dataclass
 class Config:
     token: str = os.getenv("BOT_TOKEN", "")
-    target_url: str = "https://m.nizhyn.online/noelectro/"
+    # Новый endpoint, который вы нашли
+    api_url: str = "https://m.nizhyn.online/no_electro/get_display_schedule.php"
+    # Referrer нужен, чтобы сервер не блокировал запрос
+    referer: str = "https://m.nizhyn.online/no_electro/index.php"
 
-# --- SERVICE LAYER (Парсинг и логика) ---
+# --- SERVICE LAYER (API и логика) ---
 
 class LightStatus(Enum):
     ON = "light_on"          # Світло є
@@ -42,7 +45,7 @@ class ScheduleData:
 
 class EnergyProvider:
     def __init__(self):
-        # Кэшируем ответы на 60 секунд, чтобы не нагружать сайт
+        # Кэш ключа "6_2" (queue_subqueue) на 60 секунд
         self.cache = TTLCache(maxsize=1000, ttl=60)
         self.session: Optional[aiohttp.ClientSession] = None
         self.ua = UserAgent()
@@ -58,79 +61,81 @@ class EnergyProvider:
 
     async def fetch_real_status(self, queue: str, subqueue: str) -> ScheduleData:
         """
-        Парсит сайт m.nizhyn.online.
-        Ищет блоки, содержащие номер очереди (например '6.2'), и определяет статус.
+        Делает прямой запрос к backend-скрипту.
+        Принимает: queue=6, subqueue=2
+        Возвращает: HTML-фрагмент только для этой очереди.
         """
-        full_queue = f"{queue}.{subqueue}" # Например "6.2"
-        cache_key = f"q_{full_queue}"
+        full_queue_id = f"{queue}.{subqueue}"
+        cache_key = f"{queue}_{subqueue}"
 
         if cache_key in self.cache:
-            logger.info(f"Cache hit for {full_queue}")
+            logger.info(f"Cache hit for {full_queue_id}")
             return self.cache[cache_key]
 
         try:
-            logger.info(f"Fetching data from {Config.target_url}")
             session = await self.get_session()
             
-            # Притворяемся мобильным браузером
-            headers = {'User-Agent': self.ua.random}
-            
-            async with session.get(Config.target_url, headers=headers, timeout=10) as resp:
-                if resp.status != 200:
-                    logger.error(f"Site returned status {resp.status}")
-                    return ScheduleData(LightStatus.UNKNOWN, "Сайт недоступен", datetime.now().strftime("%H:%M"))
-                
-                html = await resp.text()
+            # Параметры запроса (как в вашем fetch)
+            params = {
+                "queue": queue,
+                "subqueue": subqueue,
+                "ts": int(time.time() * 1000) # Текущий timestamp в миллисекундах
+            }
 
-            # Парсим HTML
-            soup = BeautifulSoup(html, "lxml")
+            # Заголовки (мимикрируем под браузер)
+            headers = {
+                "User-Agent": self.ua.random,
+                "Referer": Config.referer,
+                "Accept": "*/*",
+                "X-Requested-With": "XMLHttpRequest" # Хороший тон для AJAX запросов
+            }
+
+            logger.info(f"Requesting API for {full_queue_id}...")
             
-            # Логика поиска: ищем текст, похожий на очередь
-            # На сайте обычно структура: <div>Черга 6.2</div> ... <div>Статус</div>
-            # Или таблица. Мы используем универсальный поиск по тексту.
+            async with session.get(Config.api_url, params=params, headers=headers, timeout=10) as resp:
+                if resp.status != 200:
+                    logger.error(f"API Error {resp.status}")
+                    return ScheduleData(LightStatus.UNKNOWN, "Сервер не відповідачає", datetime.now().strftime("%H:%M"))
+                
+                # Сервер возвращает HTML-фрагмент
+                html_fragment = await resp.text()
+
+            # Парсим фрагмент
+            # Так как это ответ ЛИЧНО для нас, любой текст "немає" относится к НАШЕЙ очереди.
+            soup = BeautifulSoup(html_fragment, "lxml")
+            text_content = soup.get_text(separator=" ", strip=True).lower()
             
             status = LightStatus.UNKNOWN
-            details = "Дані не знайдено"
-
-            # Ищем элемент, содержащий номер очереди (например "6.2")
-            # Используем регулярку, чтобы найти именно "6.2", а не "16.20"
-            target_el = soup.find(string=re.compile(fr"\b{re.escape(full_queue)}\b"))
-
-            if target_el:
-                # Обычно статус находится в родительском контейнере или соседнем элементе
-                # Поднимаемся к родительскому блоку (карточке)
-                parent = target_el.find_parent('div') or target_el.find_parent('tr')
-                
-                if parent:
-                    text_content = parent.get_text(separator=" ", strip=True).lower()
-                    
-                    # Анализ текста на ключевые слова
-                    if "немає" in text_content or "вимкнено" in text_content or "відсутнє" in text_content:
-                        status = LightStatus.OFF
-                        details = "Світла немає ⬛"
-                    elif "є світло" in text_content or "увімкнено" in text_content or "заживлено" in text_content:
-                        status = LightStatus.ON
-                        details = "Світло є 🟦"
-                    else:
-                        # Если текст не понятен, пробуем найти цветные индикаторы (классы css)
-                        # Часто используют классы red/green
-                        css_classes = str(parent).lower()
-                        if "red" in css_classes or "danger" in css_classes:
-                            status = LightStatus.OFF
-                            details = "Світла немає (визначено по кольору) ⬛"
-                        elif "green" in css_classes or "success" in css_classes:
-                            status = LightStatus.ON
-                            details = "Світло є (визначено по кольору) 🟦"
-                else:
-                    details = "Знайдено чергу, але статус неясний"
+            
+            # Простая и надежная логика поиска в тексте ответа
+            if "світла немає" in text_content or "відсутнє" in text_content:
+                status = LightStatus.OFF
+                visual_msg = "🔴 **Світла немає**"
+            elif "світло є" in text_content or "заживлено" in text_content:
+                status = LightStatus.ON
+                visual_msg = "🟢 **Світло є**"
+            elif "можливе" in text_content:
+                status = LightStatus.POSSIBLE
+                visual_msg = "🟡 **Можливе відключення**"
             else:
-                # Если прям "6.2" не нашли, возможно там формат "6 черга, 2 підчерга"
-                # Тут можно добавить более сложную логику, но пока вернем базовый ответ
-                details = "Чергу на сторінці не знайдено. Перевірте номер."
+                # Если текст непонятен, пробуем найти подсказку во фрагменте (например время включения)
+                # Часто там пишут "Світло буде за..."
+                if "світло буде" in text_content:
+                     status = LightStatus.OFF
+                     visual_msg = "🔴 **Світла немає** (знайдено прогноз включення)"
+                else:
+                     visual_msg = "⚠️ Статус не визначено (нестандартна відповідь)"
+
+            # Пытаемся вытащить время изменений (обычно это текст типа "за 1 год 49 хв")
+            # Можно просто вернуть весь чистый текст фрагмента, если он короткий
+            clean_text = soup.get_text(separator="\n", strip=True)
+            
+            # Формируем красивый ответ
+            final_message = f"{visual_msg}\n\n📄 _Інфо з сайту:_\n{clean_text}"
 
             result = ScheduleData(
                 status=status,
-                message=details,
+                message=final_message,
                 updated_at=datetime.now().strftime("%H:%M")
             )
             
@@ -138,17 +143,17 @@ class EnergyProvider:
             return result
 
         except Exception as e:
-            logger.error(f"Parse error: {e}")
-            return ScheduleData(LightStatus.UNKNOWN, "Помилка парсингу", datetime.now().strftime("%H:%M"))
+            logger.error(f"API/Parse error: {e}")
+            return ScheduleData(LightStatus.UNKNOWN, "Помилка з'єднання", datetime.now().strftime("%H:%M"))
 
 # --- FSM & HANDLERS ---
+# (Эта часть остается без изменений, она идеальна)
 
 class UserSettings(StatesGroup):
     choosing_queue = State()
     choosing_subqueue = State()
     main_menu = State()
 
-# Инициализация
 provider = EnergyProvider()
 dp = Dispatcher(storage=MemoryStorage())
 bot = Bot(token=Config.token)
@@ -162,7 +167,7 @@ async def get_main_keyboard(queue_info: str):
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await message.answer(
-        "👋 Привіт! Я моніторю сайт **m.nizhyn.online**.\n"
+        "👋 Привіт! Я моніторю **m.nizhyn.online**.\n"
         "Обери свою чергу:",
         reply_markup=generate_queue_kb()
     )
@@ -218,18 +223,17 @@ async def check_status(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     q, sq = data.get("queue"), data.get("subqueue")
     
-    # Отправляем "печатает...", так как парсинг может занять секунду
+    # Отправляем "печатает...", чтобы пользователь видел реакцию
     await bot.send_chat_action(callback.from_user.id, action="typing")
     
     info = await provider.fetch_real_status(q, sq)
     
     text = (
         f"📊 **Черга {data.get('full_group')}**\n\n"
-        f"{info.message}\n"
+        f"{info.message}\n\n"
         f"🕒 Оновлено: {info.updated_at}"
     )
     
-    # Чтобы избежать ошибки "message not modified"
     try:
         await callback.message.edit_text(
             text, 
@@ -241,11 +245,14 @@ async def check_status(callback: types.CallbackQuery, state: FSMContext):
 
 async def main():
     logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
-    logger.info("Bot starting on Koyeb...")
+    logger.info("Bot starting on Koyeb (API Direct Mode)...")
     try:
         await dp.start_polling(bot)
     finally:
         await provider.close()
 
 if __name__ == "__main__":
+    if not Config.token:
+        logger.error("BOT_TOKEN is not set!")
+        sys.exit(1)
     asyncio.run(main())
