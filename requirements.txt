@@ -1,5 +1,8 @@
 aiogram>=3.10.0
 aiohttp>=3.9.0
 python-dotenv
-cachetools  # Для умного кэширования
-loguru      # Для красивого и детального логирования
+cachetools
+loguru
+beautifulsoup4
+lxml
+fake-useragent
