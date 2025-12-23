@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import time
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -21,10 +22,13 @@ from fake_useragent import UserAgent
 
 # --- CONFIGURATION LAYER ---
 @dataclass
-class Config:
-    token: str = os.getenv("BOT_TOKEN", "")
-    api_url: str = "https://m.nizhyn.online/no_electro/get_display_schedule.php"
-    referer: str = "https://m.nizhyn.online/no_electro/index.php"
+class ScheduleData:
+    status: LightStatus
+    message: str
+    timeline: str
+    next_event_time: Optional[datetime]
+    next_event_type: str
+    updated_at: str
 
 # --- DATA MODELS ---
 class LightStatus(Enum):
@@ -55,6 +59,62 @@ class ChatConfig:
 chats_db: Dict[int, ChatConfig] = {}
 
 # --- SERVICE LAYER ---
+import asyncio
+import os
+import sys
+import time
+import json
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional, Dict, List
+
+# Сторонние библиотеки
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from loguru import logger
+import aiohttp
+from cachetools import TTLCache
+from fake_useragent import UserAgent
+
+# --- CONFIGURATION LAYER ---
+@dataclass
+class Config:
+    token: str = os.getenv("BOT_TOKEN", "")
+    # Прямой API-путь, который мы нашли
+    api_url: str = "https://m.nizhyn.online/no_electro/get_display_schedule.php"
+    referer: str = "https://m.nizhyn.online/no_electro/index.php"
+
+# --- DATA MODELS ---
+class LightStatus(Enum):
+    ON = "light_on"
+    OFF = "light_off"
+    POSSIBLE = "light_possible"
+    UNKNOWN = "unknown"
+
+@dataclass
+class ScheduleData:
+    status: LightStatus
+    message: str
+    next_event_time: Optional[datetime]
+    next_event_type: str
+    updated_at: str
+
+@dataclass
+class ChatConfig:
+    queue: str = "1"
+    subqueue: str = "1"
+    notifications_enabled: bool = False
+    last_notified_event: Optional[str] = None # Формат: "17:00_off"
+
+# Временная база данных (chat_id -> ChatConfig)
+chats_db: Dict[int, ChatConfig] = {}
+
+# --- SERVICE LAYER (API & Parsing) ---
 class EnergyProvider:
     def __init__(self):
         self.cache = TTLCache(maxsize=1000, ttl=60)
@@ -73,137 +133,226 @@ class EnergyProvider:
 
         try:
             session = await self.get_session()
-            params = {"queue": queue, "subqueue": subqueue, "ts": int(time.time() * 1000)}
-            headers = {"User-Agent": self.ua.random, "Referer": Config.referer}
+            params = {
+                "queue": queue, 
+                "subqueue": subqueue, 
+                "ts": int(time.time() * 1000)
+            }
+            headers = {
+                "User-Agent": self.ua.random,
+                "Referer": Config.referer,
+                "X-Requested-With": "XMLHttpRequest"
+            }
             
             async with session.get(Config.api_url, params=params, headers=headers, timeout=10) as resp:
                 data = await resp.json()
 
             if not data.get("success"):
-                return self._error_data("⚠️ Ошибка API")
+                return self._error_response("⚠️ Дані на сайті тимчасово недоступні")
 
             intervals = data["data"]["today"]["intervals"]
-            
-            # Анализ данных
-            return self._process_intervals(intervals)
+            return self._process_intervals(intervals, f"{queue}.{subqueue}")
 
         except Exception as e:
             logger.error(f"Fetch error: {e}")
-            return self._error_data("❌ Ошибка соединения")
+            return self._error_response("❌ Помилка з'єднання з сервером")
 
-    def _process_intervals(self, intervals: List[dict]) -> ScheduleData:
-    now = datetime.now()
-    now_str = now.strftime("%H:%M")
-    
-    current_status_enum = LightStatus.UNKNOWN
-    next_change_time = None
-    next_change_type = ""
-    
-    # 1. Генерируем таймлайн (24 часа = 24 символа для компактности в чате)
-    # Каждый символ представляет 1 час (объединяем два интервала по 30 мин)
-    timeline_chars = []
-    for i in range(0, len(intervals), 2):
-        # Берем статус первого получаса как основной для этого часа
-        status = intervals[i]["status"]
-        char = "🟦" if status == "on" else "⬛" if status == "off" else "⬜"
-        timeline_chars.append(char)
-    
-    timeline_str = "".join(timeline_chars)
-
-    # 2. Определяем текущий статус и ищем ближайшее изменение
-    for i, interval in enumerate(intervals):
-        start = interval["start"]
-        end = interval["end"]
-        status = interval["status"]
-
-        if start <= now_str < end:
-            current_status_enum = {
-                "on": LightStatus.ON, 
-                "off": LightStatus.OFF, 
-                "maybe": LightStatus.POSSIBLE
-            }.get(status, LightStatus.UNKNOWN)
-            
-            # Ищем, когда статус станет другим
-            for future in intervals[i+1:]:
-                if future["status"] != status:
-                    next_change_time = future["start"]
-                    next_change_type = "Включення 💡" if future["status"] == "on" else "Відключення 🔌"
-                    break
-            break
-
-    # 3. Формируем "Красивый" текст
-    header = {
-        LightStatus.ON: "💎 СВІТЛО Є",
-        LightStatus.OFF: "🌑 СВІТЛА НЕМАЄ",
-        LightStatus.POSSIBLE: "⚠️ МОЖЛИВЕ ВІДКЛЮЧЕННЯ"
-    }.get(current_status_enum, "❓ СТАТУС НЕВИЗНАЧЕНИЙ")
-
-    # Добавляем маркер текущего часа на таймлайн (маленькая стрелочка снизу)
-    current_hour = now.hour
-    pointer = " " * (current_hour) + "⬆️"
-
-    msg = f"**{header}**\n"
-    if next_change_time:
-        msg += f"🕔 {next_change_type} о **{next_change_time}**\n"
-    else:
-        msg += "✅ До кінця доби змін не планується\n"
-
-    msg += f"\n📊 **Графік на сьогодні:**\n"
-    msg += f"`{timeline_str}`\n"
-    msg += f"`{pointer}`\n"
-    msg += "00    06    12    18    24\n\n"
-    msg += "🟦 _є_ | ⬛ _нема_ | ⬜ _можливо_"
-
-    return ScheduleData(
-        status=current_status_enum,
-        message=msg,
-        timeline=timeline_str,
-        next_event_time=next_change_time, # Здесь можно передать строку для простоты
-        next_event_type=next_change_type
-    )
-
-        # 2. Ищем СЛЕДУЮЩЕЕ изменение статуса
-        # Проходим по интервалам начиная с текущего времени
-        for interval in intervals:
-            if interval["start"] > now_str:
-                if interval["status"] != current_status_code:
-                    # Нашли изменение!
-                    next_time_str = interval["start"]
-                    # Превращаем "18:00" в datetime сегодня
-                    next_change_dt = datetime.strptime(next_time_str, "%H:%M").replace(
-                        year=now.year, month=now.month, day=now.day
-                    )
-                    next_type = "Включение 🟢" if interval["status"] == "on" else "Отключение 🔴"
-                    break
+    def _process_intervals(self, intervals: list, group_name: str) -> ScheduleData:
+        now = datetime.now()
+        now_str = now.strftime("%H:%M")
         
-        # Формируем сообщение
-        status_text = {
-            LightStatus.ON: "Світло є 🟢",
-            LightStatus.OFF: "Світла немає 🔴",
-            LightStatus.POSSIBLE: "Можливо відключення 🟡"
-        }.get(current_status_enum, "Невідомо")
+        current_status = LightStatus.UNKNOWN
+        current_status_code = ""
+        next_change_dt = None
+        next_change_type = ""
+        
+        # 1. Формируем таймлайн (24 символа)
+        timeline_list = []
+        for i in range(0, len(intervals), 2):
+            status = intervals[i]["status"]
+            char = "🟦" if status == "on" else "⬛" if status == "off" else "⬜"
+            timeline_list.append(char)
+        timeline_str = "".join(timeline_list)
 
-        msg = f"**{status_text}**\n"
+        # 2. Определяем текущий статус и ищем ближайшее изменение
+        for i, interval in enumerate(intervals):
+            start, end = interval["start"], interval["end"]
+            if end == "24:00": end = "23:59"
+
+            if start <= now_str <= end:
+                current_status_code = interval["status"]
+                current_status = {
+                    "on": LightStatus.ON, "off": LightStatus.OFF, "maybe": LightStatus.POSSIBLE
+                }.get(current_status_code, LightStatus.UNKNOWN)
+                
+                # Ищем следующее изменение
+                for future in intervals[i+1:]:
+                    if future["status"] != current_status_code:
+                        f_time = future["start"]
+                        next_change_type = "Включення 💡" if future["status"] == "on" else "Відключення 🔌"
+                        next_change_dt = datetime.strptime(f_time, "%H:%M").replace(
+                            year=now.year, month=now.month, day=now.day
+                        )
+                        break
+                break
+
+        # 3. Визуальное оформление
+        header = {
+            LightStatus.ON: "💎 СВІТЛО Є",
+            LightStatus.OFF: "🌑 СВІТЛА НЕМАЄ",
+            LightStatus.POSSIBLE: "⚠️ МОЖЛИВЕ ВІДКЛЮЧЕННЯ"
+        }.get(current_status, "❓ СТАТУС НЕВИЗНАЧЕНИЙ")
+
+        pointer = " " * (now.hour) + "⬆️"
+
+        msg = f"📊 **Черга {group_name}**\n\n"
+        msg += f"**{header}**\n"
+        
         if next_change_dt:
-            msg += f"⏳ {next_type} о **{next_change_dt.strftime('%H:%M')}**\n"
-        
-        msg += f"\nГрафік (00-24):\n`{timeline_str}`"
+            msg += f"🕔 {next_change_type} о **{next_change_dt.strftime('%H:%M')}**\n"
+        else:
+            msg += "✅ До кінця доби змін не планується\n"
 
-        result = ScheduleData(
-            status=current_status_enum,
+        msg += f"\n**Графік на сьогодні:**\n"
+        msg += f"`{timeline_str}`\n"
+        msg += f"`{pointer}`\n"
+        msg += "`00   06   12   18   24`\n\n"
+        msg += "🟦 _є_ | ⬛ _нема_ | ⬜ _можливо_"
+
+        res = ScheduleData(
+            status=current_status,
             message=msg,
             timeline=timeline_str,
             next_event_time=next_change_dt,
-            next_event_type=next_type,
-            raw_intervals=intervals
+            next_event_type=next_change_type,
+            updated_at=now.strftime("%H:%M")
         )
-        
-        # Кэш ключа "6_2"
-        self.cache[f"processed_{id(result)}"] = result # Хак для кэша, в реале ключ queue_sub
-        return result
+        self.cache[group_name] = res
+        return res
 
-    def _error_data(self, text):
-        return ScheduleData(LightStatus.UNKNOWN, text, "", None, "")
+    def _error_response(self, text):
+        return ScheduleData(LightStatus.UNKNOWN, text, "", None, "", datetime.now().strftime("%H:%M"))
+
+# --- NOTIFICATION MONITOR ---
+class NotificationManager:
+    def __init__(self, bot: Bot, provider: EnergyProvider):
+        self.bot = bot
+        self.provider = provider
+
+    async def start(self):
+        while True:
+            try:
+                await self.check_all_chats()
+            except Exception as e:
+                logger.error(f"Monitor error: {e}")
+            await asyncio.sleep(60)
+
+    async def check_all_chats(self):
+        # Чтобы не дергать API для каждого чата, группируем их
+        queues: Dict[str, List[int]] = {}
+        for cid, cfg in chats_db.items():
+            if cfg.notifications_enabled:
+                key = f"{cfg.queue}_{cfg.subqueue}"
+                queues.setdefault(key, []).append(cid)
+
+        for key, chat_ids in queues.items():
+            q, sq = key.split("_")
+            data = await self.provider.fetch_schedule(q, sq)
+            
+            if not data.next_event_time: continue
+
+            now = datetime.now()
+            diff = (data.next_event_time - now).total_seconds() / 60
+
+            # Если до события 14-16 минут
+            if 14 <= diff <= 16:
+                event_id = f"{data.next_event_time.strftime('%H:%M')}_{data.next_event_type}"
+                for cid in chat_ids:
+                    if chats_db[cid].last_notified_event != event_id:
+                        try:
+                            await self.bot.send_message(
+                                cid, 
+                                f"⚠️ **Увага!**\nЧерез 15 хвилин планується **{data.next_event_type}**!\n"
+                                f"Час: {data.next_event_time.strftime('%H:%M')}"
+                            )
+                            chats_db[cid].last_notified_event = event_id
+                        except Exception: pass
+
+# --- TELEGRAM HANDLERS ---
+class States(StatesGroup):
+    queue = State()
+    subqueue = State()
+
+dp = Dispatcher(storage=MemoryStorage())
+bot = Bot(token=Config.token)
+provider = EnergyProvider()
+monitor = NotificationManager(bot, provider)
+
+def get_main_kb(cid):
+    cfg = chats_db.get(cid, ChatConfig())
+    btn_text = "🔔 Викл. сповіщення" if cfg.notifications_enabled else "🔕 Вкл. сповіщення"
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="💡 Статус зараз", callback_data="status_now"))
+    builder.row(types.InlineKeyboardButton(text=btn_text, callback_data="toggle_notify"))
+    builder.row(types.InlineKeyboardButton(text=f"⚙️ Змінити ({cfg.queue}.{cfg.subqueue})", callback_data="change"))
+    return builder.as_markup()
+
+@dp.message(CommandStart())
+async def start(m: types.Message, state: FSMContext):
+    if m.chat.id not in chats_db: chats_db[m.chat.id] = ChatConfig()
+    builder = InlineKeyboardBuilder()
+    for i in range(1, 7): builder.add(types.InlineKeyboardButton(text=f"Черга {i}", callback_data=f"q_{i}"))
+    builder.adjust(3)
+    await m.answer("👋 Виберіть чергу для цього чату:", reply_markup=builder.as_markup())
+    await state.set_state(States.queue)
+
+@dp.callback_query(States.queue, F.data.startswith("q_"))
+async def set_q(c: types.CallbackQuery, state: FSMContext):
+    q = c.data.split("_")[1]
+    await state.update_data(q=q)
+    builder = InlineKeyboardBuilder()
+    for i in range(1, 5): builder.add(types.InlineKeyboardButton(text=f"{q}.{i}", callback_data=f"s_{i}"))
+    builder.adjust(2)
+    await c.message.edit_text(f"✅ Черга {q}. Виберіть підчергу:", reply_markup=builder.as_markup())
+    await state.set_state(States.subqueue)
+
+@dp.callback_query(States.subqueue, F.data.startswith("s_"))
+async def set_s(c: types.CallbackQuery, state: FSMContext):
+    s = c.data.split("_")[1]
+    data = await state.get_data()
+    cfg = chats_db[c.message.chat.id]
+    cfg.queue, cfg.subqueue = data['q'], s
+    await c.message.edit_text(f"🎉 Налаштовано! Черга {cfg.queue}.{s}", reply_markup=get_main_kb(c.message.chat.id))
+    await state.clear()
+
+@dp.callback_query(F.data == "status_now")
+async def status_now(c: types.CallbackQuery):
+    cfg = chats_db.get(c.message.chat.id)
+    if not cfg: return await c.answer("Натисніть /start")
+    res = await provider.fetch_schedule(cfg.queue, cfg.subqueue)
+    try:
+        await c.message.edit_text(res.message, reply_markup=get_main_kb(c.message.chat.id), parse_mode="Markdown")
+    except: await c.answer()
+
+@dp.callback_query(F.data == "toggle_notify")
+async def toggle(c: types.CallbackQuery):
+    cfg = chats_db[c.message.chat.id]
+    cfg.notifications_enabled = not cfg.notifications_enabled
+    await c.answer(f"Сповіщення {'увімкнено' if cfg.notifications_enabled else 'вимкнено'}")
+    await c.message.edit_reply_markup(reply_markup=get_main_kb(c.message.chat.id))
+
+@dp.callback_query(F.data == "change")
+async def change(c: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await start(c.message, state)
+
+async def main():
+    logger.add(sys.stderr, format="{time} {message}", level="INFO")
+    asyncio.create_task(monitor.start())
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 # --- BACKGROUND MONITOR ---
 class NotificationManager:
